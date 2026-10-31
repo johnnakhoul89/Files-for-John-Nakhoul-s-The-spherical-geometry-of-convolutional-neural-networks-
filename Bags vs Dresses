@@ -1,0 +1,312 @@
+
+# Bags vs Dresses-- all 9 outputs!
+
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+from torch.utils.data import DataLoader, Subset
+import os
+
+# Ensure POT is installed
+try:
+    import ot
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "POT"])
+    import ot
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+
+# --- 1. ARCHITECTURE DEFINITIONS ---
+class ExpandingCNN(nn.Module):
+    """Expanding Tower: 1 -> 16 -> 32 -> 64 -> 128 -> 256"""
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False)
+        self.layer2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.layer3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.layer4 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.layer5 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(256 * 7 * 7, 2)
+
+    def forward(self, x):
+        evo = []
+        x = self.relu(self.layer1(x)); evo.append(x)
+        x = self.relu(self.layer2(x)); evo.append(x)
+        x = self.relu(self.layer3(x)); evo.append(x)
+        x = self.relu(self.layer4(x)); evo.append(x)
+        x = self.relu(self.layer5(x)); evo.append(x)
+        logits = self.fc(x.view(x.size(0), -1))
+        return evo, logits
+
+class BottleneckCNN(nn.Module):
+    """Bottleneck Tower: 1 -> 16 -> 32 -> 64 -> 64 -> 64"""
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False)
+        self.layer2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.layer3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.layer4 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.layer5 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(64 * 14 * 14, 2)
+
+    def forward(self, x):
+        evo = []
+        x = self.relu(self.layer1(x)); evo.append(x)
+        x = self.relu(self.layer2(x)); evo.append(x)
+        x = self.relu(self.layer3(x)); evo.append(x)
+        x = self.relu(self.layer4(x)); evo.append(x)
+        x = self.relu(self.layer5(x)); evo.append(x)
+        logits = self.fc(x.view(x.size(0), -1))
+        return evo, logits
+
+class CollapsedCNN(nn.Module):
+    """Collapsed Tower: 1 -> 16 -> 32 -> 64 -> 128 -> 64"""
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False)
+        self.layer2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.layer3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.layer4 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.layer5 = nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(64 * 14 * 14, 2)
+
+    def forward(self, x):
+        evo = []
+        x = self.relu(self.layer1(x)); evo.append(x)
+        x = self.relu(self.layer2(x)); evo.append(x)
+        x = self.relu(self.layer3(x)); evo.append(x)
+        x = self.relu(self.layer4(x)); evo.append(x)
+        x = self.relu(self.layer5(x)); evo.append(x)
+        logits = self.fc(x.view(x.size(0), -1))
+        return evo, logits
+
+
+# --- 2. GEOMETRIC FUNCTIONS ---
+def compute_batch_covariance(features, epsilon=1e-5):
+    b, c, h, w = features.shape
+    t = features.view(b, c, h * w)
+    t_c = t - t.mean(dim=2, keepdim=True)
+    cov = torch.bmm(t_c, t_c.transpose(1, 2)) / (h * w - 1)
+    return cov + torch.eye(c, device=features.device).unsqueeze(0) * epsilon
+
+def matrix_log(batch_cov):
+    L, V = torch.linalg.eigh(batch_cov)
+    return V @ torch.diag_embed(torch.log(L.clamp(min=1e-12))) @ V.transpose(-2, -1)
+
+def compute_knn_accuracy(log_stack, labels):
+    num = log_stack.shape[0]
+    flat = log_stack.view(num, -1)
+    dists = torch.cdist(flat, flat, p=2)
+    dists.fill_diagonal_(float('inf'))
+    nn_indices = torch.argmin(dists, dim=1)
+    correct = (labels[nn_indices] == labels).sum().item()
+    return (correct / num) * 100
+
+def compute_gap_orc(log_stack, labels, k=15, alpha=0.1):
+    num = log_stack.shape[0]
+    flat = log_stack.view(num, -1) + torch.randn_like(log_stack.view(num, -1)) * 1e-6
+    d_matrix = torch.cdist(flat, flat, p=2)
+    d_mean = d_matrix.mean()
+    if d_mean > 0: d_matrix = d_matrix / d_mean
+    _, idx = torch.topk(d_matrix, k + 1, largest=False)
+    adj = torch.zeros_like(d_matrix).scatter_(1, idx, 1.0)
+    adj.fill_diagonal_(0.0)
+    m = (1 - alpha) * (adj / adj.sum(dim=1, keepdim=True))
+    m.fill_diagonal_(alpha)
+    intra_res, inter_res = [], []
+    d_np, m_np = d_matrix.detach().cpu().numpy(), m.detach().cpu().numpy()
+    for i in range(num):
+        for j in range(i + 1, num):
+            if adj[i, j] > 0:
+                dist_val = d_np[i, j]
+                if dist_val < 1e-9: continue
+                w1 = ot.emd2(m_np[i], m_np[j], d_np)
+                kappa = 1 - (w1 / dist_val)
+                if labels[i] == labels[j]: intra_res.append(kappa)
+                else: inter_res.append(kappa)
+
+    intra_mean = np.mean(intra_res) if len(intra_res) > 0 else np.nan
+    inter_mean = np.mean(inter_res) if len(inter_res) > 0 else np.nan
+
+    return intra_mean, inter_mean
+
+
+# --- 3. EXPERIMENT CONFIGURATION & STORAGE ---
+seeds = [42, 777, 999]
+k_values = [10, 15, 20]
+arch_dict = {
+    "Expanding": ExpandingCNN,
+    "Bottleneck": BottleneckCNN,
+    "Collapsed": CollapsedCNN
+}
+
+num_layers = 5
+num_probe = 300
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Dataset Setup (Fashion MNIST Bags vs Dresses)
+full_ds = torchvision.datasets.FashionMNIST(root='./data', train=True, download=True, transform=transforms.ToTensor())
+mask = (full_ds.targets == 8) | (full_ds.targets == 3)
+indices = torch.where(mask)[0]
+
+results = {}
+for arch_name in arch_dict:
+    results[arch_name] = {}
+    for k in k_values:
+        results[arch_name][k] = {
+            "accs": np.full((len(seeds), num_layers), np.nan),
+            "intra": np.full((len(seeds), num_layers), np.nan),
+            "inter": np.full((len(seeds), num_layers), np.nan),
+            "deltas": np.full((len(seeds), num_layers), np.nan)
+        }
+
+
+# --- 4. EXECUTION LOOP ---
+for arch_name, arch_cls in arch_dict.items():
+    print(f"\n=======================================================")
+    print(f"   EVALUATING ARCHITECTURE: {arch_name}")
+    print(f"=======================================================")
+
+    for seed_idx, seed in enumerate(seeds):
+        print(f"\n--- [Arch: {arch_name}] Running Seed {seed_idx + 1}/{len(seeds)} (Val: {seed}) ---")
+        set_seed(seed)
+
+        train_loader = DataLoader(Subset(full_ds, indices), batch_size=64, shuffle=True)
+        model = arch_cls().to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+
+        # Training
+        model.train()
+        for epoch in range(5):
+            epoch_loss = 0
+            for imgs, lbls in train_loader:
+                imgs = imgs.to(device)
+                binary_lbls = (lbls == 3).long().to(device)
+                optimizer.zero_grad()
+                _, logits = model(imgs)
+                loss = criterion(logits, binary_lbls)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+        # Probe Data Extraction
+        model.eval()
+        probe_perm = torch.randperm(len(indices))[:num_probe]
+        probe_idx = indices[probe_perm]
+        probe_imgs = torch.stack([full_ds[i][0] for i in probe_idx]).to(device)
+        raw_lbls = torch.tensor([full_ds[i][1] for i in probe_idx])
+        probe_lbls = (raw_lbls == 3).long().to(device)
+
+        with torch.no_grad():
+            evo, _ = model(probe_imgs)
+            for layer_idx, layer_feat in enumerate(evo):
+                log_stack = matrix_log(compute_batch_covariance(layer_feat))
+                acc = compute_knn_accuracy(log_stack, probe_lbls)
+
+                for k_val in k_values:
+                    intra_k, inter_k = compute_gap_orc(log_stack, probe_lbls, k=k_val)
+                    delta_k = intra_k - inter_k if not np.isnan(inter_k) else np.nan
+
+                    results[arch_name][k_val]["accs"][seed_idx, layer_idx] = acc
+                    results[arch_name][k_val]["intra"][seed_idx, layer_idx] = intra_k
+                    results[arch_name][k_val]["inter"][seed_idx, layer_idx] = inter_k
+                    results[arch_name][k_val]["deltas"][seed_idx, layer_idx] = delta_k
+
+
+# --- 5. PRINTING 9 SUMMARY TABLES ---
+print("\n" + "="*80)
+print("                   SUMMARY TABLES (MEAN ± STD ACROSS SEEDS)")
+print("="*80)
+
+for k_val in k_values:
+    for arch_name in arch_dict:
+        print(f"\n>>> Architecture: {arch_name} | k = {k_val} <<<")
+        print("-" * 75)
+        print(f"{'Layer':<10} | {'k-NN Acc (%)':<18} | {'Intra κ':<16} | {'Inter κ':<16} | {'Delta Δκ':<16}")
+        print("-" * 75)
+
+        res = results[arch_name][k_val]
+        m_acc, s_acc = np.nanmean(res["accs"], axis=0), np.nanstd(res["accs"], axis=0, ddof=1)
+        m_intra, s_intra = np.nanmean(res["intra"], axis=0), np.nanstd(res["intra"], axis=0, ddof=1)
+        m_inter, s_inter = np.nanmean(res["inter"], axis=0), np.nanstd(res["inter"], axis=0, ddof=1)
+        m_delta, s_delta = np.nanmean(res["deltas"], axis=0), np.nanstd(res["deltas"], axis=0, ddof=1)
+
+        for l_idx in range(num_layers):
+            acc_str = f"{m_acc[l_idx]:.2f} ± {s_acc[l_idx]:.2f}"
+            intra_str = f"{m_intra[l_idx]:.4f} ± {s_intra[l_idx]:.4f}"
+            inter_str = f"{m_inter[l_idx]:.4f} ± {s_inter[l_idx]:.4f}" if not np.isnan(m_inter[l_idx]) else "NaN"
+            delta_str = f"{m_delta[l_idx]:.4f} ± {s_delta[l_idx]:.4f}" if not np.isnan(m_delta[l_idx]) else "NaN"
+
+            print(f"Layer {l_idx+1:<4} | {acc_str:<18} | {intra_str:<16} | {inter_str:<16} | {delta_str:<16}")
+        print("-" * 75)
+
+
+# --- 6. PLOTTING 4 FIGURES ---
+colors = {'Expanding': '#2b5c8f', 'Bottleneck': '#d95f02', 'Collapsed': '#7570b3'}
+markers = {'Expanding': 'o', 'Bottleneck': 's', 'Collapsed': '^'}
+layers_x = np.arange(1, num_layers + 1)
+
+# Plots 1 to 3: Standalone figure per k value
+for k_val in k_values:
+    plt.figure(figsize=(8, 5))
+    for arch_name in arch_dict:
+        m_delta = np.nanmean(results[arch_name][k_val]["deltas"], axis=0)
+        s_delta = np.nanstd(results[arch_name][k_val]["deltas"], axis=0, ddof=1)
+
+        plt.plot(layers_x, m_delta, marker=markers[arch_name], color=colors[arch_name],
+                 label=arch_name, linewidth=2.5, markersize=7)
+        plt.fill_between(layers_x, m_delta - s_delta, m_delta + s_delta, color=colors[arch_name], alpha=0.15)
+
+    plt.title(fr"FashionMNIST (Bags vs Dresses): Layerwise Geometric Delta ($\Delta\kappa$) [k = {k_val}]", fontsize=12, fontweight='bold')
+    plt.xlabel("Layer Depth", fontsize=11)
+    plt.ylabel(r"Geometric Delta ($\Delta\kappa$)", fontsize=11)
+    plt.xticks(layers_x, [f"Layer {i}" for i in layers_x])
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='upper left', fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+# Plot 4: Combined 1x3 Subplot Comparison Figure across all k values
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+
+for i, k_val in enumerate(k_values):
+    ax = axes[i]
+    for arch_name in arch_dict:
+        m_delta = np.nanmean(results[arch_name][k_val]["deltas"], axis=0)
+        s_delta = np.nanstd(results[arch_name][k_val]["deltas"], axis=0, ddof=1)
+
+        ax.plot(layers_x, m_delta, marker=markers[arch_name], color=colors[arch_name],
+                label=arch_name, linewidth=2.5, markersize=7)
+        ax.fill_between(layers_x, m_delta - s_delta, m_delta + s_delta, color=colors[arch_name], alpha=0.15)
+
+    ax.set_title(f'$k = {k_val}$ Neighbors', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Layer Depth', fontsize=11)
+    if i == 0:
+        ax.set_ylabel(r'Geometric Delta ($\Delta\kappa$)', fontsize=11)
+    ax.set_xticks(layers_x)
+    ax.set_xticklabels([f"Layer {j}" for j in layers_x])
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+handles, leg_labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, leg_labels, loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=3, frameon=True, fontsize=11)
+plt.suptitle('MNIST (1 vs 7): Cross-Architecture Comparison of Geometric Separation', y=1.12, fontsize=15, fontweight='bold')
+plt.tight_layout()
+plt.show()
